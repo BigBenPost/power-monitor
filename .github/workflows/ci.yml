@@ -1,0 +1,58 @@
+name: Powerlog desktop
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  desktop:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-latest]
+    runs-on: ${{ matrix.os }}
+    env:
+      QT_QPA_PLATFORM: offscreen
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          version: '0.13.6'
+      - name: Qt runtime libraries
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libegl1 libopengl0 libxkbcommon0
+      - run: uv sync --locked --all-groups
+      - run: uv run --locked ruff check src tests
+      - run: uv run --locked ruff format --check src tests
+      - run: uv run --locked pytest -q
+      - name: Build Windows application
+        if: runner.os == 'Windows'
+        run: uv run --locked --group build pyinstaller --clean --noconfirm Powerlog.spec
+      - name: Windows bundle smoke test
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $preview = Join-Path $env:RUNNER_TEMP 'powerlog-packaged-preview.png'
+          $arguments = '--demo --screenshot "{0}"' -f $preview
+          $process = Start-Process -FilePath '.\dist\Powerlog\Powerlog.exe' -ArgumentList $arguments -PassThru
+          $null = $process.Handle
+          if (-not $process.WaitForExit(30000)) {
+            $process.Kill()
+            throw 'Packaged application timed out.'
+          }
+          if ($process.ExitCode -ne 0 -or -not (Test-Path $preview)) {
+            throw 'Packaged application failed to render.'
+          }
+      - uses: actions/upload-artifact@v4
+        if: runner.os == 'Windows'
+        with:
+          name: Powerlog-Windows-x64
+          path: dist/Powerlog/
+          if-no-files-found: error

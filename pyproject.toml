@@ -1,0 +1,45 @@
+[project]
+name = "powerlog"
+version = "0.1.0"
+description = "A quiet Windows desktop power diary for AIDA64"
+readme = "README.md"
+license = "GPL-3.0-or-later"
+license-files = ["LICENSE"]
+authors = [
+    { name = "BigBenPost", email = "42865654+BigBenPost@users.noreply.github.com" }
+]
+requires-python = ">=3.12"
+dependencies = [
+    "pyside6>=6.8,<7",
+]
+
+[project.scripts]
+powerlog = "powerlog.app:main"
+
+[project.gui-scripts]
+powerlog-desktop = "powerlog.app:main"
+
+[build-system]
+requires = ["uv_build>=0.13.6,<0.14.0"]
+build-backend = "uv_build"
+
+[dependency-groups]
+build = [
+    "pyinstaller>=6.11",
+]
+dev = [
+    "pytest>=8",
+    "pytest-qt>=4.4",
+    "ruff>=0.9",
+    "tzdata>=2026.6",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+qt_api = "pyside6"
+
+[tool.ruff]
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
