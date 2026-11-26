@@ -11,15 +11,18 @@ from PySide6.QtCore import QLockFile, QStandardPaths, QTimer
 from PySide6.QtGui import QFont, QFontDatabase
 from PySide6.QtWidgets import QApplication, QMessageBox
 
+from powerlog import __version__
 from powerlog.aida64 import SharedMemorySource
 from powerlog.controller import Controller
 from powerlog.demo import DemoSource
+from powerlog.power_events import PowerEventFilter
 from powerlog.storage import Store
 from powerlog.ui import MainWindow
 
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description="Powerlog · AIDA64 每日耗电估算")
+    parser.add_argument("--version", action="version", version=f"Powerlog {__version__}")
     parser.add_argument("--demo", action="store_true", help="使用独立演示数据，不读写真实记录")
     parser.add_argument("--data-dir", type=Path, help="数据目录，默认使用本机应用数据目录")
     parser.add_argument("--screenshot", type=Path, help="保存当前窗口截图后退出（需配合 --demo）")
@@ -32,6 +35,7 @@ def main(argv=None):
         ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("Powerlog.Desktop")
     app = QApplication(sys.argv[:1])
     app.setApplicationName("Powerlog")
+    app.setApplicationVersion(__version__)
     app.setApplicationDisplayName("电量 · Powerlog")
     app.setStyle("Fusion")
     for family in ("Microsoft YaHei UI", "Microsoft YaHei", "Noto Sans CJK SC", "Segoe UI"):
@@ -52,7 +56,7 @@ def main(argv=None):
             QStandardPaths.writableLocation(QStandardPaths.StandardLocation.AppLocalDataLocation)
         )
     )
-    store = controller = lock = None
+    store = controller = lock = power_events = None
     exit_code = 0
     try:
         directory.mkdir(parents=True, exist_ok=True)
@@ -65,6 +69,9 @@ def main(argv=None):
         store = Store(directory / ("demo.sqlite3" if args.demo else "powerlog.sqlite3"))
         source = DemoSource(store) if args.demo else SharedMemorySource()
         controller = Controller(store, source, source.clock if args.demo else None)
+        if not args.demo:
+            power_events = PowerEventFilter(controller)
+            app.installNativeEventFilter(power_events)
         window = MainWindow(controller, args.demo)
         app.aboutToQuit.connect(controller.stop)
         window.show()
@@ -93,6 +100,8 @@ def main(argv=None):
         QMessageBox.critical(None, "Powerlog 无法启动", f"无法打开本机数据。\n{exc}")
         exit_code = 1
     finally:
+        if power_events:
+            app.removeNativeEventFilter(power_events)
         if controller:
             controller.stop()
         if store:

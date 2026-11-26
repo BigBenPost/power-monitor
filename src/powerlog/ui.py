@@ -32,8 +32,10 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from powerlog import __version__
+from powerlog.brand import CONTACT_EMAIL
 from powerlog.controller import Controller
-from powerlog.storage import MAX_GAP_SECONDS, Settings
+from powerlog.storage import Settings, day_bounds
 from powerlog.widgets import ACCENT, MUTED, DailyBars, PowerChart, icon
 
 STYLE = """
@@ -242,6 +244,15 @@ class SettingsPage(QWidget):
         data_row.addWidget(path_label, 1)
         data_row.addWidget(button("打开文件夹 →", self.open_folder, "link"))
         root.addLayout(data_row)
+        self.author_label = label(
+            f"Powerlog v{__version__} · Have a problem? Contact "
+            f'<a href="mailto:{CONTACT_EMAIL}">{CONTACT_EMAIL}</a>',
+            "muted",
+            True,
+        )
+        self.author_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextBrowserInteraction)
+        self.author_label.setOpenExternalLinks(True)
+        root.addWidget(self.author_label)
         bottom = QHBoxLayout()
         self.feedback = label("修改传感器或额外功率后，将从新的有效采样重新累计。", "muted", True)
         bottom.addWidget(self.feedback, 1)
@@ -272,6 +283,9 @@ class SettingsPage(QWidget):
         self.feedback.setText("修改传感器或额外功率后，将从新的有效采样重新累计。")
 
     def refresh_sensors(self, force=False):
+        sensor_key = (tuple(self.ctrl.sensors), self.ctrl.connected)
+        if not force and sensor_key == getattr(self, "_sensor_key", None):
+            return
         checked = (
             self.checked_ids()
             if self.dirty and not force
@@ -296,6 +310,7 @@ class SettingsPage(QWidget):
             value = f"{sensor.watts:g} W" if sensor and self.ctrl.connected else "暂不可用"
             self.sensors_table.setItem(i, 2, QTableWidgetItem(value))
         self.sensors_table.blockSignals(False)
+        self._sensor_key = sensor_key
 
     def save(self):
         try:
@@ -307,10 +322,9 @@ class SettingsPage(QWidget):
                 self.tray_check.isChecked(),
             )
             self.ctrl.store.save_settings(new)
-            if old.signature != new.signature:
-                self.ctrl.recorder.break_chain()
-                self.ctrl.reading = None
             self.dirty = False
+            if old.signature != new.signature:
+                self.ctrl.reset_sampling()
             self.feedback.setText("已保存")
             self.on_save()
             self.ctrl.poll()
@@ -329,6 +343,9 @@ class MainWindow(QMainWindow):
         self.period = 7
         self.quitting = False
         self.tray_notified = False
+        self._overview_key = self._history_key = self._history_table_key = None
+        self._sensor_rows_key = None
+        self.export_dialog = None
         self.setWindowTitle("电量 · Powerlog" + (" · 演示模式" if demo else ""))
         self.setWindowIcon(icon("power", ACCENT, 32))
         self.resize(1120, 880)
@@ -423,7 +440,6 @@ class MainWindow(QMainWindow):
         self.clock_timer.timeout.connect(self.refresh)
         self.clock_timer.start()
         self.show_page(0)
-        self.refresh()
 
     def build_overview(self):
         page = QWidget()
@@ -650,23 +666,27 @@ class MainWindow(QMainWindow):
         self.today_button.setVisible(index == 0)
         for i, item in enumerate(self.nav_buttons):
             item.setChecked(i == index)
+        self.refresh()
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        self.refresh()
 
     def set_period(self, days):
         self.period = days
         for item, value in zip(self.period_buttons, (7, 30), strict=True):
             item.setChecked(value == days)
-        self.bars.set_data(
-            self.ctrl.store.days(self.ctrl.clock().date(), days), self.ctrl.clock().date()
-        )
+        self.refresh()
 
     def open_history(self, day):
+        self.history_date.setMaximumDate(QDate(self.ctrl.clock().date()))
         self.history_date.setDate(QDate(day))
         self.change_history_date(self.history_date.date())
         self.show_page(1)
 
     def change_history_date(self, value):
         self.history_day = value.toPython()
-        self.refresh_history_chart()
+        self.refresh()
 
     def select_history_row(self):
         row = self.history_table.currentRow()
@@ -676,6 +696,9 @@ class MainWindow(QMainWindow):
                 self.history_date.setDate(QDate.fromString(item.text(), "yyyy-MM-dd"))
 
     def refresh_history_chart(self):
+        key = (self.history_day, day_bounds(self.history_day), self.ctrl.store.revision)
+        if key == self._history_key:
+            return
         total = self.ctrl.store.daily(self.history_day)
         self.history_chart.set_data(
             self.history_day,
@@ -688,28 +711,25 @@ class MainWindow(QMainWindow):
             )
         else:
             self.history_summary.setText("  暂无有效累计区间")
+        self._history_key = key
 
     def refresh(self):
+        try:
+            self._refresh()
+        except (sqlite3.Error, ValueError) as exc:
+            self.notice.setVisible(True)
+            self.notice_label.setText(f"无法读取本机记录：{exc}")
+            self.status_label.setText("● 数据读取失败")
+
+    def _refresh(self):
         now = self.ctrl.clock()
         today = now.date()
         settings = self.ctrl.store.load_settings()
         total = self.ctrl.store.daily(today)
-        points = self.ctrl.store.points(today)
         self.date_label.setText(
             f"{now.year}年{now.month}月{now.day}日 · 星期{'一二三四五六日'[now.weekday()]}"
         )
-        self.energy_label.setText(f"{total.kwh:.2f}" if points else "—")
-        self.cost_label.setText(f"¥{total.kwh * settings.tariff:.2f}" if points else "¥ —")
-        self.recorded_label.setText(
-            "已记录 " + duration(total.recorded_seconds) if points else "尚未开始记录"
-        )
-        fresh = (
-            self.ctrl.reading is not None
-            and 0 <= now.timestamp() - self.ctrl.reading.timestamp <= MAX_GAP_SECONDS
-        )
-        self.power_label.setText(f"{self.ctrl.reading.watts:g} W" if fresh else "— W")
-        self.chart.set_data(today, points, self.ctrl.store.intervals(today))
-        self.bars.set_data(self.ctrl.store.days(today, self.period), today)
+        fresh = self.ctrl.is_fresh(now)
         self.notice.setVisible(bool(self.ctrl.error) or not fresh)
         self.notice_label.setText(self.ctrl.error or "等待新的有效采样；空档时间不会计入耗电量。")
         if self.ctrl.connected and fresh:
@@ -732,10 +752,43 @@ class MainWindow(QMainWindow):
         )
         if self.tray:
             self.tray.setToolTip(f"Powerlog · 今日 {total.kwh:.3f} kWh\n{status}")
+        if not self.isVisible():
+            return
+        page = self.pages.currentIndex()
+        if page == 0:
+            self.refresh_overview(today, total, settings, fresh)
+        elif page == 1:
+            self.history_date.setMaximumDate(QDate(today))
+            self.refresh_history_chart()
+            self.refresh_history_table(today, settings)
+        else:
+            self.settings_page.refresh_sensors()
+
+    def refresh_overview(self, today, total, settings, fresh):
+        self.power_label.setText(f"{self.ctrl.reading.watts:g} W" if fresh else "— W")
+        key = (today, day_bounds(today), self.ctrl.store.revision, self.period)
+        if key != self._overview_key:
+            points = self.ctrl.store.points(today)
+            self.energy_label.setText(f"{total.kwh:.2f}" if points else "—")
+            self.cost_label.setText(f"¥{total.kwh * settings.tariff:.2f}" if points else "¥ —")
+            self.recorded_label.setText(
+                "已记录 " + duration(total.recorded_seconds) if points else "尚未开始记录"
+            )
+            self.chart.set_data(today, points, self.ctrl.store.intervals(today))
+            self.bars.set_data(self.ctrl.store.days(today, self.period), today)
+            self._overview_key = key
         self.refresh_sensor_rows(settings, fresh)
-        self.settings_page.refresh_sensors()
-        self.history_date.setMaximumDate(QDate(today))
-        self.refresh_history_chart()
+
+    def refresh_history_table(self, today, settings):
+        key = (
+            today,
+            day_bounds(today),
+            self.ctrl.store.revision,
+            settings.tariff,
+            self.history_day,
+        )
+        if key == self._history_table_key:
+            return
         self.history_table.blockSignals(True)
         days = list(reversed(self.ctrl.store.days(today, 30)))
         self.history_table.setRowCount(len(days))
@@ -756,8 +809,13 @@ class MainWindow(QMainWindow):
         if selected >= 0:
             self.history_table.setCurrentCell(selected, 0)
         self.history_table.blockSignals(False)
+        self._history_table_key = key
 
     def refresh_sensor_rows(self, settings, fresh):
+        key = (settings.signature, tuple(self.ctrl.sensors), self.ctrl.reading, fresh)
+        if key == self._sensor_rows_key:
+            return
+        self._sensor_rows_key = key
         while self.sensor_rows.count():
             item = self.sensor_rows.takeAt(0)
             if item.widget():
@@ -802,17 +860,30 @@ class MainWindow(QMainWindow):
         self.sensor_rows.addStretch()
 
     def export_csv(self):
-        path, _ = QFileDialog.getSaveFileName(
-            self,
-            "导出近 30 天记录",
-            str(Path.home() / f"Powerlog-{self.ctrl.clock():%Y%m%d}.csv"),
-            "CSV 文件 (*.csv)",
-        )
-        if not path:
+        if self.export_dialog is not None:
+            self.export_dialog.raise_()
+            self.export_dialog.activateWindow()
             return
+        dialog = QFileDialog(self, "导出近 30 天记录")
+        dialog.setOption(QFileDialog.Option.DontUseNativeDialog, True)
+        dialog.setAcceptMode(QFileDialog.AcceptMode.AcceptSave)
+        dialog.setNameFilter("CSV 文件 (*.csv)")
+        dialog.setDefaultSuffix("csv")
+        dialog.selectFile(str(Path.home() / f"Powerlog-{self.ctrl.clock():%Y%m%d}.csv"))
+        dialog.fileSelected.connect(self.export_selected)
+        dialog.finished.connect(self.close_export_dialog)
+        self.export_dialog = dialog
+        # Native Windows save dialogs block QTimers, including the sampling timer.
+        dialog.open()
+
+    def close_export_dialog(self, result):
+        self.export_dialog.deleteLater()
+        self.export_dialog = None
+
+    def export_selected(self, path):
         try:
             self.write_csv(Path(path))
-        except OSError as exc:
+        except (OSError, sqlite3.Error, ValueError) as exc:
             QMessageBox.warning(self, "导出失败", str(exc))
         else:
             QMessageBox.information(self, "已导出", "已保存近 30 天的估算数据。")

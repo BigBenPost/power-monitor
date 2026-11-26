@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import math
 import sqlite3
+from collections import OrderedDict
 from dataclasses import asdict, dataclass
 from datetime import UTC, date, datetime, time, timedelta, tzinfo
 from pathlib import Path
@@ -77,8 +78,20 @@ class Store:
         path.parent.mkdir(parents=True, exist_ok=True)
         self.path = path
         self.db = sqlite3.connect(path, timeout=5)
-        if self.db.execute("PRAGMA user_version").fetchone()[0] > 1:
+        try:
+            self._initialize()
+        except Exception:
             self.db.close()
+            raise
+        self._daily_cache = OrderedDict()
+        self._cache_changes = self.db.total_changes
+
+    @property
+    def revision(self):
+        return self.db.total_changes
+
+    def _initialize(self):
+        if self.db.execute("PRAGMA user_version").fetchone()[0] > 1:
             raise ValueError("此数据文件来自更新版本的 Powerlog，请先升级程序。")
         self.db.executescript("""
             PRAGMA journal_mode=WAL;
@@ -119,6 +132,12 @@ class Store:
             )
 
     def append(self, current: Reading, previous: Reading | None):
+        self._check_cache()
+        linked = (
+            previous is not None
+            and current.signature == previous.signature
+            and 0 < current.timestamp - previous.timestamp <= MAX_GAP_SECONDS
+        )
         with self.db:
             latest = self.db.execute("SELECT MAX(ts) FROM samples").fetchone()[0]
             if latest is not None and current.timestamp <= latest:
@@ -132,11 +151,7 @@ class Store:
                     current.signature,
                 ),
             )
-            if (
-                previous is not None
-                and current.signature == previous.signature
-                and 0 < current.timestamp - previous.timestamp <= MAX_GAP_SECONDS
-            ):
+            if linked:
                 self.db.execute(
                     "INSERT INTO intervals VALUES (?, ?, ?, ?)",
                     (
@@ -146,12 +161,32 @@ class Store:
                         current.watts,
                     ),
                 )
+        # Preserve historical totals; invalidate every local day touched by the new data.
+        start = previous.timestamp if linked else current.timestamp
+        for key in list(self._daily_cache):
+            _, lower, upper = key
+            if start < upper and current.timestamp >= lower:
+                del self._daily_cache[key]
+        self._cache_changes = self.db.total_changes
+
+    def _check_cache(self):
+        # Also cover writes made directly on this connection, e.g. demo initialization.
+        if self._cache_changes != self.db.total_changes:
+            self._daily_cache.clear()
+            self._cache_changes = self.db.total_changes
 
     def daily(self, day: date, zone: tzinfo | None = None) -> DayTotal:
         lower, upper = day_bounds(day, zone)
+        self._check_cache()
+        key = (day, lower, upper)
+        if key in self._daily_cache:
+            self._daily_cache.move_to_end(key)
+            return self._daily_cache[key]
+        # All persisted intervals are at most MAX_GAP_SECONDS long. Bound their
+        # start times so old-day queries do not scan every later record.
         rows = self.db.execute(
-            "SELECT start, end, w0, w1 FROM intervals WHERE end > ? AND start < ?",
-            (lower, upper),
+            "SELECT start, end, w0, w1 FROM intervals WHERE start >= ? AND start < ?",
+            (lower - MAX_GAP_SECONDS, upper),
         )
         kwh, seconds = 0.0, 0.0
         for start, end, w0, w1 in rows:
@@ -162,7 +197,11 @@ class Store:
             "SELECT MAX(watts) FROM samples WHERE ts >= ? AND ts < ?",
             (lower, upper),
         ).fetchone()[0]
-        return DayTotal(day, kwh, seconds, peak or 0)
+        result = DayTotal(day, kwh, seconds, peak or 0)
+        self._daily_cache[key] = result
+        if len(self._daily_cache) > 128:
+            self._daily_cache.popitem(last=False)
+        return result
 
     def days(self, end: date, count: int, zone: tzinfo | None = None) -> list[DayTotal]:
         return [self.daily(end - timedelta(days=i), zone) for i in reversed(range(count))]
@@ -176,10 +215,14 @@ class Store:
 
     def intervals(self, day: date, zone: tzinfo | None = None) -> list[tuple[float, float]]:
         lower, upper = day_bounds(day, zone)
-        return self.db.execute(
-            "SELECT start, end FROM intervals WHERE end > ? AND start < ? ORDER BY start",
-            (lower, upper),
-        ).fetchall()
+        return [
+            (start, end)
+            for start, end in self.db.execute(
+                "SELECT start, end FROM intervals WHERE start >= ? AND start < ? ORDER BY start",
+                (lower - MAX_GAP_SECONDS, upper),
+            )
+            if end > lower
+        ]
 
 
 class Recorder:

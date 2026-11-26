@@ -1,12 +1,12 @@
 [project]
 name = "powerlog"
-version = "0.1.0"
+version = "1.0.0"
 description = "A quiet Windows desktop power diary for AIDA64"
 readme = "README.md"
 license = "GPL-3.0-or-later"
 license-files = ["LICENSE"]
 authors = [
-    { name = "BigBenPost", email = "42865654+BigBenPost@users.noreply.github.com" }
+    { name = "zhang.xijue", email = "zhang.xijue@u.nus.edu" }
 ]
 requires-python = ">=3.12"
 dependencies = [

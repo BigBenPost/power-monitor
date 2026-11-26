@@ -5,6 +5,7 @@
 一个安静、克制的 Windows 桌面耗电记录工具。  
 暖奶油纸面、赤陶曲线与轻量排版，只读读取 AIDA64 共享内存，在本地估算每日用电量与电费。
 
+![Version](https://img.shields.io/badge/Version-1.0.0-C2805A?style=flat-square)
 ![Platform](https://img.shields.io/badge/Platform-Windows%2010%20%2F%2011-C2805A?style=flat-square)
 ![Python](https://img.shields.io/badge/Python-3.12%2B-1D1B18?style=flat-square)
 ![UI](https://img.shields.io/badge/UI-PySide6%20(Atelier)-9B958D?style=flat-square)
@@ -32,7 +33,7 @@
 
 - **零侵入采集**：每 60 秒只读访问 AIDA64 `AIDA64_SensorValues` 共享内存，不修改系统配置，不联网，不上传任何数据。
 - **自选功率组合**：自由勾选需要统计的传感器（如 `CPU Package + GPU Power`），支持设置固定额外功率（W）与自定义电价。
-- **清晰趋势视图**：当日平滑功率曲线（支持悬停读数）、7 / 30 天每日耗电柱状图、实时传感器占比条与历史单日回溯。
+- **清晰趋势视图**：当日分段线性功率曲线（支持悬停读数，与耗电积分口径一致）、7 / 30 天每日耗电柱状图、实时传感器占比条与历史单日回溯。
 - **严谨累计口径**：基于梯形法积分，对断线、休眠、修改传感器或时间回退等异常自动断链，绝不虚构空档电量。
 - **后台静默驻留**：关闭窗口默认收起到系统托盘继续记录；支持一键导出近 30 天 UTF-8 BOM CSV，方便 Excel 直接查看。
 
@@ -89,7 +90,7 @@ uv run --locked powerlog --demo
 ```
 
 - 默认在系统临时目录生成 7 天虚拟记录，退出自动清理，不会读取 AIDA64 也不会影响真实数据。
-- 若需保留演示数据库用于预览，可指定目录（会使用独立的 `demo.sqlite3`）：
+- 若需保留演示数据库用于预览，可指定目录（会使用独立的 `demo.sqlite3`）；再次打开会保留设置，并从最新记录之后继续模拟时间：
 
 ```powershell
 uv run --locked powerlog --demo --data-dir .\preview
@@ -105,8 +106,9 @@ uv run --locked powerlog --demo --data-dir .\preview
 耗电量 (kWh) = (上次功率 W + 本次功率 W) / 2 × 间隔秒数 / 3,600,000
 ```
 
-- **断链与空档**：采样间隔超过 90 秒、共享内存读取失败、已选传感器缺失、修改传感器组合或额外功率时，均断开累计链；空档不按零功率或最后功率推算。
+- **断链与空档**：采样间隔超过 90 秒、Windows 休眠与恢复、共享内存读取失败、已选传感器缺失、修改传感器组合或额外功率时，均断开累计链；空档不按零功率或最后功率推算。
 - **跨日与时区**：跨本地午夜的区间按时间与线性功率插值拆分为两天；历史记录按当前系统本地时区自动归组。
+- **采样时间**：记录共享内存读取完成的时间；排队超过 90 秒的结果会被丢弃。系统时间与单调时钟的间隔差超过 2 秒时断开累计链，避免时间校正制造额外电量。
 - **防重复计费**：系统时间回退时，早于已有最新记录的采样会被拒绝。
 - **电价与统计范围**：修改电价仅重新计算界面和导出中的电费显示，不改写原始耗电量；CPU / GPU 传感器之和反映所选硬件估算功耗，通常低于插座侧整机功耗。
 
@@ -137,9 +139,15 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\build-windows.ps1
 
 ```powershell
 uv sync --locked --all-groups
-uv run --locked ruff check src tests
-uv run --locked ruff format --check src tests
+uv run --locked ruff check src tests scripts
+uv run --locked ruff format --check src tests scripts
 uv run --locked pytest -q
+```
+
+可用一年、每分钟一条的合成数据检查界面刷新耗时和 SQL 次数；脚本仅使用临时数据库：
+
+```sh
+QT_QPA_PLATFORM=offscreen uv run --locked python scripts/benchmark_refresh.py --days 365
 ```
 
 在无图形界面的环境中（如 Linux CI）可执行离线渲染截图检查：

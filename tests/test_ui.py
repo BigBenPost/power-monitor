@@ -1,13 +1,18 @@
 import csv
+import sqlite3
 from datetime import timedelta
+from email.utils import parseaddr
+from importlib.metadata import metadata
 
 import pytest
 from PySide6.QtCore import Qt
-from PySide6.QtGui import QFont
-from PySide6.QtWidgets import QSystemTrayIcon
+from PySide6.QtGui import QFont, QTextDocument
+from PySide6.QtWidgets import QFileDialog, QMessageBox, QSystemTrayIcon
 
+from powerlog import __version__
 from powerlog.aida64 import Sensor
-from powerlog.controller import Controller
+from powerlog.brand import AUTHOR_NAME, CONTACT_EMAIL
+from powerlog.controller import Controller, Snapshot
 from powerlog.demo import DemoSource
 from powerlog.storage import Store
 from powerlog.ui import MainWindow
@@ -22,7 +27,7 @@ def window(qtbot, qapp, tmp_path, monkeypatch):
     source = DemoSource(store)
     ctrl = Controller(store, source, source.clock)
     result = MainWindow(ctrl, demo=True)
-    qtbot.addWidget(result)
+    qtbot.addWidget(result, before_close_func=lambda widget: setattr(widget, "quitting", True))
     result.show()
     with qtbot.waitSignal(ctrl.updated, timeout=5000):
         ctrl.start()
@@ -49,6 +54,20 @@ def test_navigation_and_chart_date_selection(window, qtbot):
     assert len(window.bars.days) == 30
 
 
+def test_settings_author_matches_package_metadata(window):
+    assert (AUTHOR_NAME, CONTACT_EMAIL) == ("zhang.xijue", "zhang.xijue@u.nus.edu")
+    assert parseaddr(metadata("powerlog")["Author-email"]) == (AUTHOR_NAME, CONTACT_EMAIL)
+    assert metadata("powerlog")["Version"] == __version__
+    author = window.settings_page.author_label
+    document = QTextDocument()
+    document.setHtml(author.text())
+    assert document.toPlainText() == (
+        f"Powerlog v{__version__} · Have a problem? Contact {CONTACT_EMAIL}"
+    )
+    assert f'href="mailto:{CONTACT_EMAIL}"' in author.text()
+    assert author.openExternalLinks()
+
+
 def test_save_sensor_choices_tariff_overhead_and_preserve_draft(window, qtbot):
     window.show_page(2)
     page = window.settings_page
@@ -71,7 +90,9 @@ def test_save_sensor_choices_tariff_overhead_and_preserve_draft(window, qtbot):
 def test_read_failure_clears_live_power_and_keeps_history(window, qtbot):
     qtbot.waitUntil(lambda: window.ctrl.worker is None)
     total = window.energy_label.text()
-    window.ctrl.receive([], "AIDA64 未启动")
+    window.ctrl.receive(
+        Snapshot([], "AIDA64 未启动", window.ctrl.clock(), window.ctrl.elapsed_clock(), 0)
+    )
     assert window.power_label.text() == "— W"
     assert window.energy_label.text() == total
     assert window.notice.isVisible()
@@ -99,9 +120,12 @@ def test_no_exported_power_has_clear_empty_state(qtbot, tmp_path, monkeypatch):
     qtbot.addWidget(win)
     try:
         win.show()
-        ctrl.receive([Sensor("CPU", "CPU Package", 50)], "")
+        ctrl.receive(
+            Snapshot([Sensor("CPU", "CPU Package", 50)], "", ctrl.clock(), ctrl.elapsed_clock(), 0)
+        )
         assert win.energy_label.text() == "—"
         assert "选择" in win.notice_label.text()
+        win.show_page(2)
         assert win.settings_page.ids == ["CPU"]
         assert win.settings_page.checked_ids() == ()
     finally:
@@ -130,3 +154,77 @@ def test_stale_reading_is_not_presented_as_live(window, qtbot):
     window.refresh()
     assert window.power_label.text() == "— W"
     assert window.notice.isVisible()
+
+
+def test_export_dialog_keeps_sampling_and_cancels_cleanly(window, qtbot):
+    ctrl = window.ctrl
+    qtbot.waitUntil(lambda: ctrl.worker is None)
+    before = ctrl.store.db.execute("SELECT COUNT(*) FROM samples").fetchone()[0]
+    ctrl.timer.setInterval(20)
+    window.export_csv()
+    dialog = window.export_dialog
+    assert dialog.testOption(QFileDialog.Option.DontUseNativeDialog)
+    assert dialog.isVisible()
+    qtbot.waitUntil(
+        lambda: ctrl.store.db.execute("SELECT COUNT(*) FROM samples").fetchone()[0] >= before + 2,
+        timeout=5000,
+    )
+    dialog.reject()
+    assert window.export_dialog is None
+    ctrl.timer.setInterval(60000)
+
+
+def test_export_dialog_saves_selected_file(window, qtbot, tmp_path, monkeypatch):
+    monkeypatch.setattr(QMessageBox, "information", lambda *args: None)
+    path = tmp_path / "export.csv"
+    window.export_csv()
+    dialog = window.export_dialog
+    dialog.selectFile(str(path))
+    dialog.accept()
+    assert window.export_dialog is None
+    assert path.read_bytes().startswith(b"\xef\xbb\xbf")
+    with path.open(encoding="utf-8-sig", newline="") as stream:
+        assert len(list(csv.reader(stream))) == 31
+
+
+def test_hidden_refresh_skips_pages_and_reveal_updates(window, qtbot, monkeypatch):
+    qtbot.waitUntil(lambda: window.ctrl.worker is None)
+    store = window.ctrl.store
+    queries = []
+    store.db.set_trace_callback(queries.append)
+    window.hide()
+    for _ in range(3):
+        window.refresh()
+    store.db.set_trace_callback(None)
+    assert not any("FROM samples" in query or "FROM intervals" in query for query in queries)
+    monkeypatch.setattr(window.chart, "set_data", lambda *args: pytest.fail("chart was rebuilt"))
+    window.show()  # No changed data: the existing chart is retained.
+    window.refresh()
+
+
+def test_periodic_refresh_keeps_hover_and_settings_items(window, qtbot):
+    qtbot.waitUntil(lambda: window.ctrl.worker is None)
+    window.chart.hover_index = 3
+    window.refresh()
+    assert window.chart.hover_index == 3
+    window.show_page(2)
+    page = window.settings_page
+    item = page.sensors_table.item(0, 0)
+    page.tariff.setValue(0.75)
+    window.refresh()
+    assert page.sensors_table.item(0, 0) is item
+    assert page.tariff.value() == 0.75
+
+
+def test_database_read_failure_is_visible_and_recoverable(window, monkeypatch):
+    original = window.ctrl.store.daily
+
+    def fail(*args, **kwargs):
+        raise sqlite3.DatabaseError("test database failure")
+
+    monkeypatch.setattr(window.ctrl.store, "daily", fail)
+    window.refresh()
+    assert "test database failure" in window.notice_label.text()
+    monkeypatch.setattr(window.ctrl.store, "daily", original)
+    window.refresh()
+    assert "test database failure" not in window.notice_label.text()

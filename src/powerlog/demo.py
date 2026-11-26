@@ -6,16 +6,23 @@ import time
 from datetime import datetime, timedelta
 
 from powerlog.aida64 import Sensor
-from powerlog.storage import Settings, Store
+from powerlog.storage import SAMPLE_SECONDS, Settings, Store
 
 
 class DemoSource:
-    def __init__(self, store: Store):
+    def __init__(self, store: Store, *, now=None):
         self.started = time.monotonic()
-        self.base = datetime.now().astimezone().replace(hour=18, minute=42, second=0, microsecond=0)
+        self.base = (now or datetime.now().astimezone()).replace(
+            hour=18, minute=42, second=0, microsecond=0
+        )
         settings = Settings(("PCPUPKG", "PGPU1"))
-        store.save_settings(settings)
-        if store.db.execute("SELECT COUNT(*) FROM samples").fetchone()[0]:
+        if not store.db.execute("SELECT 1 FROM settings WHERE key='preferences'").fetchone():
+            store.save_settings(settings)
+        latest = store.db.execute("SELECT MAX(ts) FROM samples").fetchone()[0]
+        if latest is not None:
+            self.base = datetime.fromtimestamp(
+                max(self.base.timestamp(), latest + SAMPLE_SECONDS), self.base.tzinfo
+            )
             return
         samples, intervals = [], []
         for offset in reversed(range(7)):

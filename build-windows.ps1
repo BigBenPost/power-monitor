@@ -10,8 +10,10 @@ Push-Location $PSScriptRoot
 try {
     uv sync --locked --all-groups
     if ($LASTEXITCODE -ne 0) { throw 'Dependency installation failed.' }
-    uv run --locked ruff check src tests
+    uv run --locked ruff check src tests scripts
     if ($LASTEXITCODE -ne 0) { throw 'Code checks failed.' }
+    uv run --locked ruff format --check src tests scripts
+    if ($LASTEXITCODE -ne 0) { throw 'Formatting checks failed.' }
     uv run --locked pytest -q
     if ($LASTEXITCODE -ne 0) { throw 'Tests failed.' }
     uv run --locked --group build pyinstaller --clean --noconfirm Powerlog.spec

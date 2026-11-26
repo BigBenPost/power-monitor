@@ -189,3 +189,64 @@ def test_signature_normalizes_equivalent_numeric_overhead():
         Settings(("CPU",), overhead_watts=0).signature
         == Settings(("CPU",), overhead_watts=0.0).signature
     )
+
+
+def test_daily_cache_invalidates_both_sides_of_midnight_and_timezone(store):
+    recorder = Recorder(store)
+    start = datetime(2026, 11, 18, 23, 59, 30, tzinfo=UTC)
+    next_day = start.date() + timedelta(days=1)
+    tokyo = ZoneInfo("Asia/Tokyo")
+    assert store.daily(start.date(), UTC).kwh == 0
+    assert store.daily(next_day, UTC).kwh == 0
+    assert store.daily(next_day, tokyo).kwh == 0
+    sensors = [Sensor("CPU", "CPU", 100)]
+    recorder.record(sensors, start)
+    recorder.record(sensors, start + timedelta(seconds=60))
+    assert store.daily(start.date(), UTC).recorded_seconds == 30
+    assert store.daily(next_day, UTC).recorded_seconds == 30
+    assert store.daily(next_day, tokyo).recorded_seconds == 60
+    queries = []
+    store.db.set_trace_callback(queries.append)
+    store.daily(start.date(), UTC)
+    store.daily(next_day, UTC)
+    store.daily(next_day, tokyo)
+    store.db.set_trace_callback(None)
+    assert queries == []
+
+
+def test_failed_interval_insert_rolls_back_sample_and_recovers(store):
+    recorder = Recorder(store)
+    start = datetime(2026, 11, 18, 8, tzinfo=UTC)
+    sensors = [Sensor("CPU", "CPU", 100)]
+    recorder.record(sensors, start)
+    store.db.execute("""CREATE TRIGGER fail_interval BEFORE INSERT ON intervals
+                        BEGIN SELECT RAISE(FAIL, 'test interval failure'); END""")
+    with pytest.raises(sqlite3.Error, match="interval failure"):
+        recorder.record(sensors, start + timedelta(seconds=60))
+    assert store.db.execute("SELECT COUNT(*) FROM samples").fetchone()[0] == 1
+    assert recorder.previous is None
+    assert store.daily(start.date(), UTC).recorded_seconds == 0
+    store.db.execute("DROP TRIGGER fail_interval")
+    recorder.record(sensors, start + timedelta(seconds=120))
+    assert store.daily(start.date(), UTC).recorded_seconds == 0
+    recorder.record(sensors, start + timedelta(seconds=180))
+    assert store.daily(start.date(), UTC).recorded_seconds == 60
+
+
+def test_initialization_failure_closes_connection(tmp_path, monkeypatch):
+    path = tmp_path / "broken.sqlite3"
+    with sqlite3.connect(path) as db:
+        db.execute("CREATE TABLE intervals (incompatible TEXT)")
+    connect = sqlite3.connect
+    connections = []
+
+    def track(*args, **kwargs):
+        db = connect(*args, **kwargs)
+        connections.append(db)
+        return db
+
+    monkeypatch.setattr("powerlog.storage.sqlite3.connect", track)
+    with pytest.raises(sqlite3.Error):
+        Store(path)
+    with pytest.raises(sqlite3.ProgrammingError, match="closed"):
+        connections[0].execute("SELECT 1")

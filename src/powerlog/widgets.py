@@ -125,27 +125,11 @@ class PowerChart(QWidget):
         start = max(lower, min(start.timestamp(), end - 6 * 3600))
         return start, min(upper, max(end, start + 6 * 3600))
 
-    def _smooth_path(self, points: list[QPointF]) -> QPainterPath:
+    def _line_path(self, points: list[QPointF]) -> QPainterPath:
         path = QPainterPath(points[0])
-        if len(points) < 3:
-            for pt in points[1:]:
-                path.lineTo(pt)
-            return path
-        tension = 0.35
-        for i in range(len(points) - 1):
-            p0 = points[max(0, i - 1)]
-            p1 = points[i]
-            p2 = points[i + 1]
-            p3 = points[min(len(points) - 1, i + 2)]
-            cp1 = QPointF(
-                p1.x() + (p2.x() - p0.x()) * tension,
-                p1.y() + (p2.y() - p0.y()) * tension,
-            )
-            cp2 = QPointF(
-                p2.x() - (p3.x() - p1.x()) * tension,
-                p2.y() - (p3.y() - p1.y()) * tension,
-            )
-            path.cubicTo(cp1, cp2, p2)
+        # Match the piecewise linear interpolation used by energy integration.
+        for point in points[1:]:
+            path.lineTo(point)
         return path
 
     def paintEvent(self, event):
@@ -200,7 +184,7 @@ class PowerChart(QWidget):
         gradient.setColorAt(0, QColor(194, 128, 90, 20))
         gradient.setColorAt(1, QColor(194, 128, 90, 0))
         for group in groups:
-            path = self._smooth_path(group)
+            path = self._line_path(group)
             if len(group) > 1:
                 fill = QPainterPath(path)
                 fill.lineTo(group[-1].x(), area.bottom())
